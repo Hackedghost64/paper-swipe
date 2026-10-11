@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:audioplayers/audioplayers.dart' as audio;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:flutter_pdf_text/flutter_pdf_text.dart';
 import 'package:kittentts/kittentts_flutter.dart';
 import 'package:pdfx/pdfx.dart';
@@ -292,14 +294,53 @@ class _ReaderScreenState extends State<ReaderScreen>
   Future<KittenTTS> _getKittenTts() async {
     final existing = _kittenTts;
     if (existing != null) return existing;
+
+    final docDir = await getApplicationSupportDirectory();
+    final modelDir = Directory('${docDir.path}/kitten_tts');
+    if (!await modelDir.exists()) {
+      await modelDir.create(recursive: true);
+    }
+
+    final onnxFile = File('${modelDir.path}/kitten_tts_micro_v0_8.onnx');
+    if (!await onnxFile.exists() || await onnxFile.length() == 0) {
+      final byteData = await rootBundle.load('assets/models/kitten_tts/kitten_tts_micro_v0_8.onnx');
+      await onnxFile.writeAsBytes(byteData.buffer.asUint8List(byteData.offsetInBytes, byteData.lengthInBytes), flush: true);
+    }
+
+    final voicesFile = File('${modelDir.path}/voices.npz');
+    if (!await voicesFile.exists() || await voicesFile.length() == 0) {
+      final byteData = await rootBundle.load('assets/models/kitten_tts/voices.npz');
+      await voicesFile.writeAsBytes(byteData.buffer.asUint8List(byteData.offsetInBytes, byteData.lengthInBytes), flush: true);
+    }
+
+    final rulesFile = File('${modelDir.path}/en_rules');
+    if (!await rulesFile.exists() || await rulesFile.length() == 0) {
+      final byteData = await rootBundle.load('assets/models/kitten_tts/en_rules');
+      await rulesFile.writeAsBytes(byteData.buffer.asUint8List(byteData.offsetInBytes, byteData.lengthInBytes), flush: true);
+    }
+
+    final listFile = File('${modelDir.path}/en_list');
+    if (!await listFile.exists() || await listFile.length() == 0) {
+      final byteData = await rootBundle.load('assets/models/kitten_tts/en_list');
+      await listFile.writeAsBytes(byteData.buffer.asUint8List(byteData.offsetInBytes, byteData.lengthInBytes), flush: true);
+    }
+
     final tts = await KittenTTS.create(
       player: _kittenPlayer,
-      config: const KittenTTSConfig(
+      config: KittenTTSConfig(
         model: 'micro',
         defaultVoice: 'luna',
         speed: 0.94,
         ortNumThreads: 2,
         analytics: false,
+        modelFiles: KittenTTSModelFiles(
+          onnxPath: onnxFile.path,
+          voicesPath: voicesFile.path,
+        ),
+        phonemizer: CEPhonemizer(
+          rulesPath: rulesFile.path,
+          listPath: listFile.path,
+        ),
       ),
     );
     _kittenTts = tts;
