@@ -68,8 +68,12 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   @override
   void dispose() {
-    // Save last page on exit
-    widget.bookRepository.updateProgress(widget.book.id, _currentPage - 1);
+    // Flush last page on exit immediately to avoid any data loss
+    widget.bookRepository.updateProgress(
+      widget.book.id,
+      _currentPage - 1,
+      immediate: true,
+    );
     _pdfController.dispose();
 
     // Restore standard system UI bars
@@ -81,8 +85,12 @@ class _ReaderScreenState extends State<ReaderScreen> {
     setState(() {
       _currentPage = page;
     });
-    // Auto-save memory retention
-    widget.bookRepository.updateProgress(widget.book.id, page - 1);
+    // Auto-save memory retention with debounce to prevent disk thrashing
+    widget.bookRepository.updateProgress(
+      widget.book.id,
+      page - 1,
+      immediate: false,
+    );
   }
 
   void _toggleHud() {
@@ -224,52 +232,56 @@ class _ReaderScreenState extends State<ReaderScreen> {
                     ),
                   ),
                   const SizedBox(width: 8),
-                  // Night Inversion Mode Button
-                  InkWell(
-                    onTap: () {
-                      setState(() {
-                        _nightInvert = !_nightInvert;
-                      });
-                    },
-                    borderRadius: BorderRadius.circular(10),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 10, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: _nightInvert
-                            ? AppTheme.amberGold
-                            : AppTheme.slateCardLight,
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(
+                  Tooltip(
+                    message: _nightInvert
+                        ? 'Disable Night Invert'
+                        : 'Enable Night Invert (High-contrast for text & web novels)',
+                    child: InkWell(
+                      onTap: () {
+                        setState(() {
+                          _nightInvert = !_nightInvert;
+                        });
+                      },
+                      borderRadius: BorderRadius.circular(10),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 6),
+                        decoration: BoxDecoration(
                           color: _nightInvert
                               ? AppTheme.amberGold
-                              : AppTheme.borderSubtle,
-                        ),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            _nightInvert
-                                ? Icons.nightlight_round
-                                : Icons.wb_sunny_outlined,
-                            size: 14,
+                              : AppTheme.slateCardLight,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
                             color: _nightInvert
-                                ? AppTheme.obsidianBg
-                                : AppTheme.amberGold,
+                                ? AppTheme.amberGold
+                                : AppTheme.borderSubtle,
                           ),
-                          const SizedBox(width: 5),
-                          Text(
-                            _nightInvert ? 'NIGHT' : 'DAY',
-                            style: TextStyle(
-                              fontSize: 11,
-                              fontWeight: FontWeight.bold,
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              _nightInvert
+                                  ? Icons.nightlight_round
+                                  : Icons.wb_sunny_outlined,
+                              size: 14,
                               color: _nightInvert
                                   ? AppTheme.obsidianBg
                                   : AppTheme.amberGold,
                             ),
-                          ),
-                        ],
+                            const SizedBox(width: 5),
+                            Text(
+                              _nightInvert ? 'NIGHT' : 'DAY',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                                color: _nightInvert
+                                    ? AppTheme.obsidianBg
+                                    : AppTheme.amberGold,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ),

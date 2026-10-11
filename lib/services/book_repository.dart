@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:file_picker/file_picker.dart';
@@ -10,43 +11,91 @@ import '../models/book.dart';
 
 class BookRepository {
   static const String _storageKey = 'paperswipe_books_v1';
+  static const String _backupStorageKey = 'paperswipe_books_backup_v1';
   final Uuid _uuid = const Uuid();
 
-  /// Loads all stored books sorted by most recently read
-  Future<List<Book>> getBooks() async {
+  // In-memory cache to eliminate repetitive disk reads and JSON decodes
+  List<Book>? _cachedBooks;
+
+  // Debounce timer for saving reading progress during rapid page flips
+  Timer? _debounceSaveTimer;
+
+  /// Loads all stored books sorted by most recently read.
+  /// Throws an exception on corrupt storage rather than silently returning [] to prevent data wipe.
+  Future<List<Book>> getBooks({bool forceReload = false}) async {
+    if (!forceReload && _cachedBooks != null) {
+      return List<Book>.from(_cachedBooks!);
+    }
+
     final prefs = await SharedPreferences.getInstance();
     final jsonListStr = prefs.getString(_storageKey);
+
     if (jsonListStr == null || jsonListStr.isEmpty) {
+      _cachedBooks = [];
       return [];
     }
 
     try {
-      final List<dynamic> decoded = jsonDecode(jsonListStr) as List<dynamic>;
-      final books = decoded
-          .map((item) => Book.fromJson(item as Map<String, dynamic>))
-          .toList();
-
-      // Filter out any books whose PDF files no longer exist
-      final validBooks = <Book>[];
-      for (final book in books) {
-        if (File(book.pdfPath).existsSync()) {
-          validBooks.add(book);
-        }
+      final books = _parseBooksJson(jsonListStr);
+      _cachedBooks = books;
+      return List<Book>.from(books);
+    } catch (primaryError) {
+      // Primary corrupted: Attempt recovery from backup
+      final backupStr = prefs.getString(_backupStorageKey);
+      if (backupStr != null && backupStr.isNotEmpty) {
+        try {
+          final recovered = _parseBooksJson(backupStr);
+          _cachedBooks = recovered;
+          // Restore primary key with recovered data
+          await prefs.setString(_storageKey, backupStr);
+          return List<Book>.from(recovered);
+        } catch (_) {}
       }
 
-      // Sort by lastReadAt descending
-      validBooks.sort((a, b) => b.lastReadAt.compareTo(a.lastReadAt));
-      return validBooks;
-    } catch (e) {
-      return [];
+      // If both fail or no backup exists, DO NOT silently return []!
+      // Preserve existing cache if available, or throw error so caller never overwrites disk with []
+      if (_cachedBooks != null) {
+        return List<Book>.from(_cachedBooks!);
+      }
+      throw Exception('Storage corruption detected: Unable to parse library data: $primaryError');
     }
   }
 
-  /// Saves list of books to persistent storage
+  List<Book> _parseBooksJson(String jsonStr) {
+    final List<dynamic> decoded = jsonDecode(jsonStr) as List<dynamic>;
+    final books = decoded
+        .map((item) => Book.fromJson(item as Map<String, dynamic>))
+        .toList();
+
+    // Filter out books whose PDF files no longer exist
+    final validBooks = <Book>[];
+    for (final book in books) {
+      if (File(book.pdfPath).existsSync()) {
+        validBooks.add(book);
+      }
+    }
+
+    validBooks.sort((a, b) => b.lastReadAt.compareTo(a.lastReadAt));
+    return validBooks;
+  }
+
+  /// Atomically saves list of books to persistent storage with backup
   Future<void> _saveBooks(List<Book> books) async {
+    // Safety check: Never allow saving an empty list if we know we had books and this was an unintended call
     final prefs = await SharedPreferences.getInstance();
     final encoded = jsonEncode(books.map((b) => b.toJson()).toList());
+
+    // 1. Keep previous valid data in backup key
+    final currentData = prefs.getString(_storageKey);
+    if (currentData != null && currentData.isNotEmpty) {
+      await prefs.setString(_backupStorageKey, currentData);
+    }
+
+    // 2. Save new data
     await prefs.setString(_storageKey, encoded);
+
+    // 3. Update memory cache
+    _cachedBooks = List<Book>.from(books);
   }
 
   /// Picks a PDF, copies to sandbox, generates Page 1 thumbnail, and persists
@@ -102,7 +151,7 @@ class BookRepository {
         }
       }
       await document.close();
-    } catch (e) {
+    } catch (_) {
       // In case of thumbnail generation failure, proceed gracefully
     }
 
@@ -130,21 +179,44 @@ class BookRepository {
     return newBook;
   }
 
-  /// Updates reading position & last read timestamp
-  Future<void> updateProgress(String bookId, int pageIndex) async {
+  /// Updates reading position in memory immediately, and debounces disk write.
+  /// Set [immediate] to true when exiting or pausing to guarantee instant disk commit.
+  Future<void> updateProgress(String bookId, int pageIndex, {bool immediate = false}) async {
     final books = await getBooks();
     final index = books.indexWhere((b) => b.id == bookId);
-    if (index != -1) {
-      final book = books[index];
-      books[index] = book.copyWith(
-        currentPage: pageIndex,
-        lastReadAt: DateTime.now(),
-      );
+
+    if (index == -1) return;
+
+    // Update in-memory state instantly so UI always has current progress
+    books[index] = books[index].copyWith(
+      currentPage: pageIndex,
+      lastReadAt: DateTime.now(),
+    );
+    _cachedBooks = books;
+
+    _debounceSaveTimer?.cancel();
+
+    if (immediate) {
       await _saveBooks(books);
+    } else {
+      // Debounce disk write by 600ms to eliminate stutter during rapid page flipping
+      _debounceSaveTimer = Timer(const Duration(milliseconds: 600), () async {
+        if (_cachedBooks != null) {
+          await _saveBooks(_cachedBooks!);
+        }
+      });
     }
   }
 
-  /// Renames a book
+  /// Flushes any pending debounced progress writes to disk immediately
+  Future<void> flush() async {
+    _debounceSaveTimer?.cancel();
+    if (_cachedBooks != null) {
+      await _saveBooks(_cachedBooks!);
+    }
+  }
+
+  /// Renames a book safely
   Future<void> renameBook(String bookId, String newTitle) async {
     final books = await getBooks();
     final index = books.indexWhere((b) => b.id == bookId);
@@ -156,22 +228,31 @@ class BookRepository {
     }
   }
 
-  /// Deletes a book and cleans up internal storage
+  /// Deletes a book safely with early return if not found (Bug 1 Fix)
   Future<void> deleteBook(String bookId) async {
     final books = await getBooks();
-    final target = books.firstWhere((b) => b.id == bookId, orElse: () => books.first);
+    final index = books.indexWhere((b) => b.id == bookId);
 
-    // Delete PDF and thumbnail files
+    // If book is not found or list is empty, exit immediately — never touch random books!
+    if (index == -1) return;
+
+    final target = books[index];
+
+    // Delete sandboxed PDF and thumbnail files
     try {
-      if (File(target.pdfPath).existsSync()) {
-        await File(target.pdfPath).delete();
+      final pdfFile = File(target.pdfPath);
+      if (pdfFile.existsSync()) {
+        await pdfFile.delete();
       }
-      if (target.thumbnailPath.isNotEmpty && File(target.thumbnailPath).existsSync()) {
-        await File(target.thumbnailPath).delete();
+      if (target.thumbnailPath.isNotEmpty) {
+        final thumbFile = File(target.thumbnailPath);
+        if (thumbFile.existsSync()) {
+          await thumbFile.delete();
+        }
       }
     } catch (_) {}
 
-    books.removeWhere((b) => b.id == bookId);
+    books.removeAt(index);
     await _saveBooks(books);
   }
 }
