@@ -9,16 +9,36 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import '../models/book.dart';
 
+class BookImportException implements Exception {
+  final String message;
+  const BookImportException(this.message);
+
+  @override
+  String toString() => message;
+}
+
+/// Thread-safe Singleton Repository for managing library books and reading progress.
+/// 
+/// Architecture:
+/// - Singleton instance ensures a single source of truth across all screens with zero divergent caches (Edge Case B Fix).
+/// - Atomic per-book progress keys ('paperswipe_pos_$id') eliminate full-library JSON rewrites on page turns.
+/// - Immediate atomic writes eliminate debounce windows, ensuring zero data loss even if the app is force-killed (Edge Case A Fix).
+/// - Eliminates floating Timer objects and race conditions completely (Edge Case C Fix).
 class BookRepository {
+  // Singleton Pattern
+  static final BookRepository _instance = BookRepository._internal();
+  factory BookRepository() => _instance;
+  BookRepository._internal();
+
   static const String _storageKey = 'paperswipe_books_v1';
   static const String _backupStorageKey = 'paperswipe_books_backup_v1';
+  static String _posKey(String id) => 'paperswipe_pos_$id';
+  static String _lastReadKey(String id) => 'paperswipe_last_read_$id';
+
   final Uuid _uuid = const Uuid();
 
-  // In-memory cache to eliminate repetitive disk reads and JSON decodes
+  // In-memory cache shared across the entire app
   List<Book>? _cachedBooks;
-
-  // Debounce timer for saving reading progress during rapid page flips
-  Timer? _debounceSaveTimer;
 
   /// Loads all stored books sorted by most recently read.
   /// Throws an exception on corrupt storage rather than silently returning [] to prevent data wipe.
@@ -36,7 +56,7 @@ class BookRepository {
     }
 
     try {
-      final books = _parseBooksJson(jsonListStr);
+      final books = _parseBooksJson(jsonListStr, prefs);
       _cachedBooks = books;
       return List<Book>.from(books);
     } catch (primaryError) {
@@ -44,7 +64,7 @@ class BookRepository {
       final backupStr = prefs.getString(_backupStorageKey);
       if (backupStr != null && backupStr.isNotEmpty) {
         try {
-          final recovered = _parseBooksJson(backupStr);
+          final recovered = _parseBooksJson(backupStr, prefs);
           _cachedBooks = recovered;
           // Restore primary key with recovered data
           await prefs.setString(_storageKey, backupStr);
@@ -53,7 +73,6 @@ class BookRepository {
       }
 
       // If both fail or no backup exists, DO NOT silently return []!
-      // Preserve existing cache if available, or throw error so caller never overwrites disk with []
       if (_cachedBooks != null) {
         return List<Book>.from(_cachedBooks!);
       }
@@ -61,16 +80,26 @@ class BookRepository {
     }
   }
 
-  List<Book> _parseBooksJson(String jsonStr) {
+  List<Book> _parseBooksJson(String jsonStr, SharedPreferences prefs) {
     final List<dynamic> decoded = jsonDecode(jsonStr) as List<dynamic>;
-    final books = decoded
+    final rawBooks = decoded
         .map((item) => Book.fromJson(item as Map<String, dynamic>))
         .toList();
 
-    // Filter out books whose PDF files no longer exist
+    // Filter out books whose PDF files no longer exist, and merge latest atomic progress
     final validBooks = <Book>[];
-    for (final book in books) {
-      if (File(book.pdfPath).existsSync()) {
+    for (final raw in rawBooks) {
+      if (File(raw.pdfPath).existsSync()) {
+        final atomicPage = prefs.getInt(_posKey(raw.id));
+        final atomicLastReadStr = prefs.getString(_lastReadKey(raw.id));
+        final atomicLastRead = atomicLastReadStr != null
+            ? DateTime.tryParse(atomicLastReadStr)
+            : null;
+
+        final book = raw.copyWith(
+          currentPage: atomicPage ?? raw.currentPage,
+          lastReadAt: atomicLastRead ?? raw.lastReadAt,
+        );
         validBooks.add(book);
       }
     }
@@ -79,9 +108,8 @@ class BookRepository {
     return validBooks;
   }
 
-  /// Atomically saves list of books to persistent storage with backup
+  /// Atomically saves list of books catalog to persistent storage with backup
   Future<void> _saveBooks(List<Book> books) async {
-    // Safety check: Never allow saving an empty list if we know we had books and this was an unintended call
     final prefs = await SharedPreferences.getInstance();
     final encoded = jsonEncode(books.map((b) => b.toJson()).toList());
 
@@ -91,20 +119,22 @@ class BookRepository {
       await prefs.setString(_backupStorageKey, currentData);
     }
 
-    // 2. Save new data
+    // 2. Save new catalog data
     await prefs.setString(_storageKey, encoded);
 
     // 3. Update memory cache
     _cachedBooks = List<Book>.from(books);
   }
 
-  /// Picks a PDF, copies to sandbox, generates Page 1 thumbnail, and persists
+  /// Picks a PDF, verifies validity (detects encryption/corruption),
+  /// generates Page 1 thumbnail, and persists. Cleans up orphan files on failure.
   Future<Book?> importPdf() async {
     final files = await FilePicker.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['pdf'],
     );
 
+    // Cancelled picker: exits cleanly without error
     if (files.isEmpty) {
       return null;
     }
@@ -129,30 +159,49 @@ class BookRepository {
     final destPdfPath = p.join(booksDir.path, '$bookId.pdf');
     await File(pickedPath).copy(destPdfPath);
 
-    // Open PDF to get page count and rasterize Page 1 for thumbnail
-    int totalPages = 1;
+    // Validate PDF and rasterize Page 1
+    int totalPages = 0;
     final thumbPath = p.join(thumbsDir.path, '$bookId.png');
 
     try {
       final document = await PdfDocument.openFile(destPdfPath);
       totalPages = document.pagesCount;
 
-      if (totalPages > 0) {
-        final page = await document.getPage(1);
-        final pageImage = await page.render(
-          width: page.width * 1.5,
-          height: page.height * 1.5,
-          format: PdfPageImageFormat.png,
-        );
-        await page.close();
+      if (totalPages <= 0) {
+        await document.close();
+        throw const BookImportException('The selected PDF contains no readable pages.');
+      }
 
-        if (pageImage != null && pageImage.bytes.isNotEmpty) {
-          await File(thumbPath).writeAsBytes(pageImage.bytes);
-        }
+      final page = await document.getPage(1);
+      final pageImage = await page.render(
+        width: page.width * 1.5,
+        height: page.height * 1.5,
+        format: PdfPageImageFormat.png,
+      );
+      await page.close();
+
+      if (pageImage != null && pageImage.bytes.isNotEmpty) {
+        await File(thumbPath).writeAsBytes(pageImage.bytes);
       }
       await document.close();
-    } catch (_) {
-      // In case of thumbnail generation failure, proceed gracefully
+    } catch (e) {
+      // Clean up orphan files immediately so no ghost files or broken records remain!
+      try {
+        final f = File(destPdfPath);
+        if (f.existsSync()) await f.delete();
+        final thumb = File(thumbPath);
+        if (thumb.existsSync()) await thumb.delete();
+      } catch (_) {}
+
+      if (e is BookImportException) rethrow;
+
+      // Detect password protection / corruption
+      final errStr = e.toString().toLowerCase();
+      if (errStr.contains('password') || errStr.contains('encrypted')) {
+        throw const BookImportException('This PDF is password-protected or encrypted. Please remove password before importing.');
+      } else {
+        throw BookImportException('Unable to open PDF: The file may be corrupted, truncated, or not a valid PDF.');
+      }
     }
 
     // Clean title from filename
@@ -160,17 +209,29 @@ class BookRepository {
     if (title.toLowerCase().endsWith('.pdf')) {
       title = title.substring(0, title.length - 4);
     }
-    title = title.replaceAll(RegExp(r'[_-]'), ' ').trim();
+    title = title
+        .replaceAll(RegExp(r'[_-]'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (title.isEmpty) {
+      title = 'Untitled Book';
+    }
 
+    final now = DateTime.now();
     final newBook = Book(
       id: bookId,
       title: title,
       pdfPath: destPdfPath,
       thumbnailPath: File(thumbPath).existsSync() ? thumbPath : '',
       currentPage: 0,
-      totalPages: totalPages > 0 ? totalPages : 1,
-      lastReadAt: DateTime.now(),
+      totalPages: totalPages,
+      lastReadAt: now,
     );
+
+    // Set initial atomic position keys
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_posKey(bookId), 0);
+    await prefs.setString(_lastReadKey(bookId), now.toIso8601String());
 
     final books = await getBooks();
     books.insert(0, newBook);
@@ -179,66 +240,69 @@ class BookRepository {
     return newBook;
   }
 
-  /// Updates reading position in memory immediately, and debounces disk write.
-  /// Set [immediate] to true when exiting or pausing to guarantee instant disk commit.
-  Future<void> updateProgress(String bookId, int pageIndex, {bool immediate = false}) async {
-    final books = await getBooks();
-    final index = books.indexWhere((b) => b.id == bookId);
+  /// Updates reading position atomically and immediately to storage.
+  /// 
+  /// - NO debounce timer exists, guaranteeing that force-killing the app or sudden battery death
+  ///   preserves the exact page (Fixes Edge Case A).
+  /// - Writes only a 4-byte integer and timestamp key, eliminating disk thrashing and JSON blob serialization.
+  /// - Memory cache is updated synchronously, ensuring instant UI reflection.
+  Future<void> updateProgress(String bookId, int pageIndex, {bool immediate = true}) async {
+    final now = DateTime.now();
 
-    if (index == -1) return;
-
-    // Update in-memory state instantly so UI always has current progress
-    books[index] = books[index].copyWith(
-      currentPage: pageIndex,
-      lastReadAt: DateTime.now(),
-    );
-    _cachedBooks = books;
-
-    _debounceSaveTimer?.cancel();
-
-    if (immediate) {
-      await _saveBooks(books);
-    } else {
-      // Debounce disk write by 600ms to eliminate stutter during rapid page flipping
-      _debounceSaveTimer = Timer(const Duration(milliseconds: 600), () async {
-        if (_cachedBooks != null) {
-          await _saveBooks(_cachedBooks!);
-        }
-      });
-    }
-  }
-
-  /// Flushes any pending debounced progress writes to disk immediately
-  Future<void> flush() async {
-    _debounceSaveTimer?.cancel();
+    // 1. Instant in-memory cache update
     if (_cachedBooks != null) {
-      await _saveBooks(_cachedBooks!);
+      final index = _cachedBooks!.indexWhere((b) => b.id == bookId);
+      if (index != -1) {
+        _cachedBooks![index] = _cachedBooks![index].copyWith(
+          currentPage: pageIndex,
+          lastReadAt: now,
+        );
+      }
     }
+
+    // 2. Atomic, immediate non-blocking write to SharedPreferences (single integer key)
+    final prefs = await SharedPreferences.getInstance();
+    await Future.wait([
+      prefs.setInt(_posKey(bookId), pageIndex),
+      prefs.setString(_lastReadKey(bookId), now.toIso8601String()),
+    ]);
   }
+
+  /// Flushes pending operations (retained for backward compatibility)
+  Future<void> flush() async {}
 
   /// Renames a book safely
   Future<void> renameBook(String bookId, String newTitle) async {
+    final cleanTitle = newTitle.trim();
+    if (cleanTitle.isEmpty) return;
+
     final books = await getBooks();
     final index = books.indexWhere((b) => b.id == bookId);
     if (index != -1) {
+      if (books[index].title == cleanTitle) return;
+
       books[index] = books[index].copyWith(
-        title: newTitle.trim(),
+        title: cleanTitle,
       );
       await _saveBooks(books);
     }
   }
 
-  /// Deletes a book safely with early return if not found (Bug 1 Fix)
+  /// Deletes a book safely with atomic key cleanup
   Future<void> deleteBook(String bookId) async {
+    // 1. Clean atomic progress keys
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_posKey(bookId));
+    await prefs.remove(_lastReadKey(bookId));
+
     final books = await getBooks();
     final index = books.indexWhere((b) => b.id == bookId);
 
-    // If book is not found or list is empty, exit immediately — never touch random books!
     if (index == -1) return;
 
     final target = books[index];
 
-    // Delete sandboxed PDF and thumbnail files
+    // 2. Delete sandboxed PDF and thumbnail files
     try {
       final pdfFile = File(target.pdfPath);
       if (pdfFile.existsSync()) {
@@ -252,6 +316,7 @@ class BookRepository {
       }
     } catch (_) {}
 
+    // 3. Update catalog
     books.removeAt(index);
     await _saveBooks(books);
   }

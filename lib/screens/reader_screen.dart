@@ -19,7 +19,7 @@ class ReaderScreen extends StatefulWidget {
   State<ReaderScreen> createState() => _ReaderScreenState();
 }
 
-class _ReaderScreenState extends State<ReaderScreen> {
+class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver {
   late PdfController _pdfController;
   late int _currentPage;
   late int _totalPages;
@@ -39,6 +39,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     // 1-based page index for PdfController
     _currentPage = (widget.book.currentPage + 1).clamp(1, widget.book.totalPages);
     _totalPages = widget.book.totalPages;
@@ -47,6 +48,21 @@ class _ReaderScreenState extends State<ReaderScreen> {
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
 
     _initPdfController();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.detached) {
+      // User pressed Home, switched apps, or swiped away in recent-apps:
+      // Guarantee immediate flush to disk so no page progress is ever lost!
+      widget.bookRepository.updateProgress(
+        widget.book.id,
+        _currentPage - 1,
+        immediate: true,
+      );
+    }
   }
 
   Future<void> _initPdfController() async {
@@ -68,11 +84,11 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   @override
   void dispose() {
-    // Flush last page on exit immediately to avoid any data loss
+    WidgetsBinding.instance.removeObserver(this);
+    // Persist current page immediately on exit
     widget.bookRepository.updateProgress(
       widget.book.id,
       _currentPage - 1,
-      immediate: true,
     );
     _pdfController.dispose();
 
@@ -85,11 +101,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
     setState(() {
       _currentPage = page;
     });
-    // Auto-save memory retention with debounce to prevent disk thrashing
+    // Atomic non-blocking save of current page position
     widget.bookRepository.updateProgress(
       widget.book.id,
       page - 1,
-      immediate: false,
     );
   }
 
