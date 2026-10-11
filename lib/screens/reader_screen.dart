@@ -1,5 +1,11 @@
+import 'dart:async';
+import 'dart:typed_data';
+
+import 'package:audioplayers/audioplayers.dart' as audio;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_pdf_text/flutter_pdf_text.dart';
+import 'package:kittentts/kittentts_flutter.dart';
 import 'package:pdfx/pdfx.dart';
 import '../models/book.dart';
 import '../services/book_repository.dart';
@@ -19,7 +25,8 @@ class ReaderScreen extends StatefulWidget {
   State<ReaderScreen> createState() => _ReaderScreenState();
 }
 
-class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver {
+class _ReaderScreenState extends State<ReaderScreen>
+    with WidgetsBindingObserver {
   late PdfController _pdfController;
   late int _currentPage;
   late int _totalPages;
@@ -27,13 +34,43 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   bool _nightInvert = false;
   bool _isLoading = true;
   String? _errorMessage;
+  final _KittenAudioPlayer _kittenPlayer = _KittenAudioPlayer();
+  final Map<int, String> _pageText = {};
+  KittenTTS? _kittenTts;
+  Timer? _highlightTimer;
+  final Stopwatch _playbackClock = Stopwatch();
+  bool _isReadAlongVisible = false;
+  bool _isLoadingReadAlong = false;
+  bool _isSpeaking = false;
+  bool _isPaused = false;
+  bool _isPreparingVoice = false;
+  String? _readAlongError;
+  String _spokenText = '';
+  List<KittenWordTiming> _wordTimings = const [];
+  int? _activeWordIndex;
 
   // Inversion matrix to convert white PDF pages to dark surfaces
   static const ColorFilter _nightInvertFilter = ColorFilter.matrix([
-    -1, 0, 0, 0, 255,
-    0, -1, 0, 0, 255,
-    0, 0, -1, 0, 255,
-    0, 0, 0, 1, 0,
+    -1,
+    0,
+    0,
+    0,
+    255,
+    0,
+    -1,
+    0,
+    0,
+    255,
+    0,
+    0,
+    -1,
+    0,
+    255,
+    0,
+    0,
+    0,
+    1,
+    0,
   ]);
 
   @override
@@ -41,7 +78,10 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     // 1-based page index for PdfController
-    _currentPage = (widget.book.currentPage + 1).clamp(1, widget.book.totalPages);
+    _currentPage = (widget.book.currentPage + 1).clamp(
+      1,
+      widget.book.totalPages,
+    );
     _totalPages = widget.book.totalPages;
 
     // Enable sticky immersive mode for silent, distraction-free reading
@@ -86,11 +126,11 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     // Persist current page immediately on exit
-    widget.bookRepository.updateProgress(
-      widget.book.id,
-      _currentPage - 1,
-    );
-    _pdfController.dispose();
+    widget.bookRepository.updateProgress(widget.book.id, _currentPage - 1);
+    _stopNarration();
+    _kittenTts?.dispose();
+    _kittenPlayer.dispose();
+    if (!_isLoading) _pdfController.dispose();
 
     // Restore standard system UI bars
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -98,14 +138,16 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
   }
 
   void _onPageChanged(int page) {
+    _stopNarration();
     setState(() {
       _currentPage = page;
+      _isSpeaking = false;
+      _isPaused = false;
+      _activeWordIndex = null;
+      _isReadAlongVisible = false;
     });
     // Atomic non-blocking save of current page position
-    widget.bookRepository.updateProgress(
-      widget.book.id,
-      page - 1,
-    );
+    widget.bookRepository.updateProgress(widget.book.id, page - 1);
   }
 
   void _toggleHud() {
@@ -129,6 +171,187 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
         curve: Curves.easeOutCubic,
         duration: const Duration(milliseconds: 250),
       );
+    }
+  }
+
+  Future<void> _openReadAlong() async {
+    setState(() {
+      _showHud = true;
+      _isReadAlongVisible = true;
+      _isLoadingReadAlong = true;
+      _readAlongError = null;
+      _activeWordIndex = null;
+    });
+
+    try {
+      final text = await _textForPage(_currentPage);
+      if (!mounted) return;
+      if (text.trim().isEmpty) {
+        setState(() {
+          _spokenText = '';
+          _readAlongError = 'This page has no selectable text to read.';
+          _isLoadingReadAlong = false;
+        });
+        return;
+      }
+      setState(() {
+        _spokenText = text;
+        _isLoadingReadAlong = false;
+      });
+      await _speakCurrentPage();
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _readAlongError = 'Could not extract readable text from this page.';
+          _isLoadingReadAlong = false;
+        });
+      }
+    }
+  }
+
+  Future<String> _textForPage(int page) async {
+    final cached = _pageText[page];
+    if (cached != null) return cached;
+    final document = await PDFDoc.fromPath(widget.book.pdfPath);
+    final text = await document.pageAt(page).text;
+    _pageText[page] = text;
+    return text;
+  }
+
+  Future<void> _speakCurrentPage() async {
+    if (_spokenText.trim().isEmpty) return;
+    await _stopNarration();
+    if (!mounted) return;
+    setState(() => _isPreparingVoice = true);
+    try {
+      final tts = await _getKittenTts();
+      final result = await tts.generate(
+        _spokenText,
+        voice: 'luna',
+        speed: 0.94,
+      );
+      if (!mounted) return;
+      setState(() {
+        _wordTimings = result.wordTimings;
+        _isPreparingVoice = false;
+      });
+      await tts.play(
+        result,
+        AudioPlayOptions(onPlaybackStart: _startHighlighting),
+      );
+      _resetNarrationState();
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _isPreparingVoice = false;
+          _readAlongError = 'Could not prepare the offline narrator.';
+        });
+      }
+    }
+  }
+
+  Future<void> _togglePlayback() async {
+    if (_isSpeaking) {
+      await _kittenTts?.pauseSpeaking();
+      _playbackClock.stop();
+      _highlightTimer?.cancel();
+      if (mounted) {
+        setState(() {
+          _isSpeaking = false;
+          _isPaused = true;
+        });
+      }
+      return;
+    }
+    if (_isPaused) {
+      await _kittenTts?.resumeSpeaking();
+      _playbackClock.start();
+      _startHighlightTimer();
+      if (mounted) {
+        setState(() {
+          _isSpeaking = true;
+          _isPaused = false;
+        });
+      }
+      return;
+    }
+    await _speakCurrentPage();
+  }
+
+  Future<void> _closeReadAlong() async {
+    await _stopNarration();
+    if (mounted) {
+      setState(() {
+        _isReadAlongVisible = false;
+        _isSpeaking = false;
+        _isPaused = false;
+      });
+    }
+  }
+
+  Future<KittenTTS> _getKittenTts() async {
+    final existing = _kittenTts;
+    if (existing != null) return existing;
+    final tts = await KittenTTS.create(
+      player: _kittenPlayer,
+      config: const KittenTTSConfig(
+        model: 'micro',
+        defaultVoice: 'luna',
+        speed: 0.94,
+        ortNumThreads: 2,
+        analytics: false,
+      ),
+    );
+    _kittenTts = tts;
+    return tts;
+  }
+
+  void _startHighlighting() {
+    _playbackClock
+      ..reset()
+      ..start();
+    _startHighlightTimer();
+    if (mounted) {
+      setState(() {
+        _isPreparingVoice = false;
+        _isSpeaking = true;
+        _isPaused = false;
+      });
+    }
+  }
+
+  void _startHighlightTimer() {
+    _highlightTimer?.cancel();
+    _highlightTimer = Timer.periodic(const Duration(milliseconds: 45), (_) {
+      if (!mounted) return;
+      final elapsed = _playbackClock.elapsedMilliseconds / 1000;
+      final active = _wordTimings.where(
+        (timing) => elapsed >= timing.startTime && elapsed < timing.endTime,
+      );
+      setState(
+        () => _activeWordIndex = active.isEmpty ? null : active.first.wordIndex,
+      );
+    });
+  }
+
+  Future<void> _stopNarration() async {
+    _highlightTimer?.cancel();
+    _highlightTimer = null;
+    _playbackClock
+      ..stop()
+      ..reset();
+    await _kittenTts?.stop();
+    _resetNarrationState();
+  }
+
+  void _resetNarrationState() {
+    if (mounted) {
+      setState(() {
+        _isSpeaking = false;
+        _isPaused = false;
+        _isPreparingVoice = false;
+        _activeWordIndex = null;
+      });
     }
   }
 
@@ -228,8 +451,11 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
               child: Row(
                 children: [
                   IconButton(
-                    icon: const Icon(Icons.arrow_back_ios_new_rounded,
-                        size: 18, color: AppTheme.amberGold),
+                    icon: const Icon(
+                      Icons.arrow_back_ios_new_rounded,
+                      size: 18,
+                      color: AppTheme.amberGold,
+                    ),
                     onPressed: () => Navigator.of(context).pop(),
                     tooltip: 'Back to Library',
                   ),
@@ -247,6 +473,16 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
                     ),
                   ),
                   const SizedBox(width: 8),
+                  IconButton(
+                    icon: Icon(
+                      _isReadAlongVisible
+                          ? Icons.record_voice_over
+                          : Icons.volume_up_outlined,
+                      color: AppTheme.amberGold,
+                    ),
+                    onPressed: _openReadAlong,
+                    tooltip: 'Read this page aloud',
+                  ),
                   Tooltip(
                     message: _nightInvert
                         ? 'Disable Night Invert'
@@ -260,7 +496,9 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
                       borderRadius: BorderRadius.circular(10),
                       child: Container(
                         padding: const EdgeInsets.symmetric(
-                            horizontal: 10, vertical: 6),
+                          horizontal: 10,
+                          vertical: 6,
+                        ),
                         decoration: BoxDecoration(
                           color: _nightInvert
                               ? AppTheme.amberGold
@@ -305,11 +543,24 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
             ),
           ),
 
-          // 4. Minimal HUD Bottom Bar
+          // 4. Read Along sheet. Text lives outside the PDF canvas so any
+          // selectable-text PDF can be followed without page-coordinate data.
+          if (_isReadAlongVisible)
+            Positioned(
+              left: 16,
+              right: 16,
+              bottom: MediaQuery.of(context).padding.bottom + 16,
+              child: _buildReadAlongSheet(),
+            ),
+
+          // 5. Minimal HUD Bottom Bar
           AnimatedPositioned(
             duration: const Duration(milliseconds: 200),
             curve: Curves.easeOut,
-            bottom: _showHud ? MediaQuery.of(context).padding.bottom + 16 : -110,
+            bottom: _showHud
+                ? MediaQuery.of(context).padding.bottom +
+                      (_isReadAlongVisible ? 278 : 16)
+                : -110,
             left: 16,
             right: 16,
             child: Container(
@@ -331,7 +582,10 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
                 children: [
                   // Fast Page Scrub Slider
                   Slider(
-                    value: _currentPage.toDouble().clamp(1.0, _totalPages.toDouble()),
+                    value: _currentPage.toDouble().clamp(
+                      1.0,
+                      _totalPages.toDouble(),
+                    ),
                     min: 1.0,
                     max: _totalPages > 1 ? _totalPages.toDouble() : 1.0,
                     divisions: _totalPages > 1 ? _totalPages - 1 : 1,
@@ -378,4 +632,214 @@ class _ReaderScreenState extends State<ReaderScreen> with WidgetsBindingObserver
       ),
     );
   }
+
+  Widget _buildReadAlongSheet() {
+    return Container(
+      constraints: const BoxConstraints(maxHeight: 245),
+      padding: const EdgeInsets.fromLTRB(16, 12, 12, 14),
+      decoration: BoxDecoration(
+        color: const Color(0xF50D0F12),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: AppTheme.borderSubtle),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.55),
+            blurRadius: 18,
+            offset: const Offset(0, 5),
+          ),
+        ],
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(
+                Icons.record_voice_over,
+                size: 18,
+                color: AppTheme.amberGold,
+              ),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'READ ALONG',
+                  style: TextStyle(
+                    color: AppTheme.textPrimary,
+                    fontSize: 12,
+                    letterSpacing: 0.8,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+              IconButton(
+                icon: const Icon(
+                  Icons.close,
+                  color: AppTheme.textSecondary,
+                  size: 20,
+                ),
+                onPressed: _closeReadAlong,
+                tooltip: 'Close read along',
+              ),
+            ],
+          ),
+          if (_isLoadingReadAlong || _isPreparingVoice)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 38),
+              child: Column(
+                children: [
+                  CircularProgressIndicator(color: AppTheme.amberGold),
+                  SizedBox(height: 12),
+                  Text(
+                    'Preparing Luna, your offline narrator…',
+                    style: TextStyle(color: AppTheme.textSecondary),
+                  ),
+                ],
+              ),
+            )
+          else if (_readAlongError != null)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 28),
+              child: Text(
+                _readAlongError!,
+                style: const TextStyle(
+                  color: AppTheme.textSecondary,
+                  height: 1.4,
+                ),
+              ),
+            )
+          else ...[
+            Expanded(
+              child: SingleChildScrollView(
+                child: Text.rich(
+                  TextSpan(
+                    style: const TextStyle(
+                      color: AppTheme.textPrimary,
+                      height: 1.55,
+                      fontSize: 15,
+                    ),
+                    children: _highlightedText(),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                IconButton(
+                  icon: Icon(
+                    _isSpeaking
+                        ? Icons.pause_circle_filled
+                        : Icons.play_circle_fill,
+                    color: AppTheme.amberGold,
+                    size: 34,
+                  ),
+                  onPressed: _togglePlayback,
+                  tooltip: _isSpeaking
+                      ? 'Pause'
+                      : (_isPaused ? 'Resume page' : 'Read page'),
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  _isSpeaking
+                      ? 'READING PAGE $_currentPage'
+                      : 'PAGE $_currentPage',
+                  style: const TextStyle(
+                    color: AppTheme.textSecondary,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.4,
+                  ),
+                ),
+                const Spacer(),
+                TextButton.icon(
+                  onPressed: _speakCurrentPage,
+                  icon: const Icon(Icons.replay, size: 17),
+                  label: const Text('RESTART'),
+                  style: TextButton.styleFrom(
+                    foregroundColor: AppTheme.amberGold,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  List<InlineSpan> _highlightedText() {
+    final matches = RegExp(
+      r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*",
+    ).allMatches(_spokenText);
+    final spans = <InlineSpan>[];
+    var cursor = 0;
+    var wordIndex = 0;
+    for (final match in matches) {
+      if (match.start > cursor) {
+        spans.add(TextSpan(text: _spokenText.substring(cursor, match.start)));
+      }
+      spans.add(
+        TextSpan(
+          text: match.group(0),
+          style: wordIndex == _activeWordIndex
+              ? const TextStyle(
+                  color: AppTheme.obsidianBg,
+                  backgroundColor: AppTheme.amberGold,
+                  fontWeight: FontWeight.w700,
+                )
+              : null,
+        ),
+      );
+      cursor = match.end;
+      wordIndex++;
+    }
+    if (cursor < _spokenText.length) {
+      spans.add(TextSpan(text: _spokenText.substring(cursor)));
+    }
+    return spans.isEmpty ? [TextSpan(text: _spokenText)] : spans;
+  }
+}
+
+class _KittenAudioPlayer implements AudioPlayer {
+  final audio.AudioPlayer _player = audio.AudioPlayer();
+
+  @override
+  Future<void> play(
+    Float32List samples,
+    int sampleRate, {
+    AudioPlayOptions options = const AudioPlayOptions(),
+  }) async {
+    final completed = _player.onPlayerComplete.first;
+    await _player.stop();
+    await _player.play(
+      audio.BytesSource(
+        WAVEncoder.encode(samples, sampleRate),
+        mimeType: 'audio/wav',
+      ),
+    );
+    options.onPlaybackStart?.call();
+    await Future.any([
+      completed,
+      Future<void>.delayed(
+        Duration(
+          milliseconds: (samples.length / sampleRate * 1000).ceil() + 750,
+        ),
+      ),
+    ]);
+  }
+
+  @override
+  Future<void> stop() => _player.stop();
+
+  @override
+  Future<void> pause() => _player.pause();
+
+  @override
+  Future<void> resume() => _player.resume();
+
+  @override
+  bool get isPlaying => _player.state == audio.PlayerState.playing;
+
+  Future<void> dispose() => _player.dispose();
 }
