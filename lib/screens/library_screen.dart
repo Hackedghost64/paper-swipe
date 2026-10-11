@@ -26,23 +26,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Future<void> _loadBooks() async {
-    setState(() {
-      _isLoading = true;
-      _loadError = null;
-    });
+    setState(() => _isLoading = true);
     try {
       final books = await _repository.getBooks();
       if (mounted) {
         setState(() {
           _books = books;
           _isLoading = false;
+          _loadError = null;
         });
       }
     } catch (e) {
       if (mounted) {
         setState(() {
-          _loadError = e.toString();
           _isLoading = false;
+          _loadError = 'Library storage is corrupted and could not be recovered.';
         });
       }
     }
@@ -357,61 +355,28 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Widget _buildErrorState() {
     return Center(
-      child: SingleChildScrollView(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 24),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Container(
-                width: 80,
-                height: 80,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: const Color(0xFFC0392B).withValues(alpha: 0.15),
-                  border: Border.all(color: const Color(0xFFC0392B), width: 1.5),
-                ),
-                child: const Icon(
-                  Icons.warning_amber_rounded,
-                  size: 40,
-                  color: Color(0xFFE74C3C),
-                ),
-              ),
-              const SizedBox(height: 20),
-              const Text(
-                'Library Database Error',
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w700,
-                  color: AppTheme.textPrimary,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                _loadError ?? 'Unable to parse library storage.',
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  fontSize: 12,
-                  color: AppTheme.textSecondary,
-                  height: 1.4,
-                ),
-              ),
-              const SizedBox(height: 24),
-              ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFFC0392B),
-                  foregroundColor: Colors.white,
-                ),
-                onPressed: () async {
-                  await _repository.resetLibrary();
-                  _loadBooks();
-                },
-                icon: const Icon(Icons.refresh_rounded, size: 18),
-                label: const Text('Reset Library'),
-              ),
-            ],
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Icon(Icons.warning_amber_rounded, size: 48, color: Colors.redAccent),
+          const SizedBox(height: 16),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Text(
+              _loadError!,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: AppTheme.textSecondary),
+            ),
           ),
-        ),
+          const SizedBox(height: 20),
+          ElevatedButton(
+            onPressed: () async {
+              await _repository.resetLibrary();
+              _loadBooks();
+            },
+            child: const Text('Reset Library'),
+          ),
+        ],
       ),
     );
   }
