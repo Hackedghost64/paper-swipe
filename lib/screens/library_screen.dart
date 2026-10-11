@@ -17,6 +17,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
   List<Book> _books = [];
   bool _isLoading = true;
   bool _isImporting = false;
+  String? _loadError;
 
   @override
   void initState() {
@@ -25,13 +26,25 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Future<void> _loadBooks() async {
-    setState(() => _isLoading = true);
-    final books = await _repository.getBooks();
-    if (mounted) {
-      setState(() {
-        _books = books;
-        _isLoading = false;
-      });
+    setState(() {
+      _isLoading = true;
+      _loadError = null;
+    });
+    try {
+      final books = await _repository.getBooks();
+      if (mounted) {
+        setState(() {
+          _books = books;
+          _isLoading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _loadError = e.toString();
+          _isLoading = false;
+        });
+      }
     }
   }
 
@@ -304,9 +317,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         child:
                             CircularProgressIndicator(color: AppTheme.amberGold),
                       )
-                    : _books.isEmpty
-                        ? _buildEmptyState()
-                        : RefreshIndicator(
+                    : _loadError != null
+                        ? _buildErrorState()
+                        : _books.isEmpty
+                            ? _buildEmptyState()
+                            : RefreshIndicator(
                             color: AppTheme.amberGold,
                             backgroundColor: AppTheme.slateCard,
                             onRefresh: _loadBooks,
@@ -332,6 +347,67 @@ class _LibraryScreenState extends State<LibraryScreen> {
                               },
                             ),
                           ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildErrorState() {
+    return Center(
+      child: SingleChildScrollView(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                width: 80,
+                height: 80,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: const Color(0xFFC0392B).withValues(alpha: 0.15),
+                  border: Border.all(color: const Color(0xFFC0392B), width: 1.5),
+                ),
+                child: const Icon(
+                  Icons.warning_amber_rounded,
+                  size: 40,
+                  color: Color(0xFFE74C3C),
+                ),
+              ),
+              const SizedBox(height: 20),
+              const Text(
+                'Library Database Error',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                  color: AppTheme.textPrimary,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                _loadError ?? 'Unable to parse library storage.',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 12,
+                  color: AppTheme.textSecondary,
+                  height: 1.4,
+                ),
+              ),
+              const SizedBox(height: 24),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFFC0392B),
+                  foregroundColor: Colors.white,
+                ),
+                onPressed: () async {
+                  await _repository.resetLibrary();
+                  _loadBooks();
+                },
+                icon: const Icon(Icons.refresh_rounded, size: 18),
+                label: const Text('Reset Library'),
               ),
             ],
           ),

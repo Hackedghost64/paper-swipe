@@ -40,6 +40,14 @@ class BookRepository {
   // In-memory cache shared across the entire app
   List<Book>? _cachedBooks;
 
+  /// Clears corrupted library database keys and resets in-memory cache
+  Future<void> resetLibrary() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_storageKey);
+    await prefs.remove(_backupStorageKey);
+    _cachedBooks = [];
+  }
+
   /// Loads all stored books sorted by most recently read.
   /// Throws an exception on corrupt storage rather than silently returning [] to prevent data wipe.
   Future<List<Book>> getBooks({bool forceReload = false}) async {
@@ -73,9 +81,7 @@ class BookRepository {
       }
 
       // If both fail or no backup exists, DO NOT silently return []!
-      if (_cachedBooks != null) {
-        return List<Book>.from(_cachedBooks!);
-      }
+      _cachedBooks = null;
       throw Exception('Storage corruption detected: Unable to parse library data: $primaryError');
     }
   }
