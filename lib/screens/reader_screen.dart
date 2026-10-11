@@ -38,6 +38,7 @@ class _ReaderScreenState extends State<ReaderScreen>
   String? _errorMessage;
   final _KittenAudioPlayer _kittenPlayer = _KittenAudioPlayer();
   final Map<int, String> _pageText = {};
+  final ScrollController _readAlongScrollController = ScrollController();
   KittenTTS? _kittenTts;
   Timer? _highlightTimer;
   final Stopwatch _playbackClock = Stopwatch();
@@ -50,6 +51,12 @@ class _ReaderScreenState extends State<ReaderScreen>
   String _spokenText = '';
   List<KittenWordTiming> _wordTimings = const [];
   int? _activeWordIndex;
+  String _selectedVoice = 'luna';
+  double _playbackSpeed = 1.0;
+  int _currentSentenceIndex = 0;
+  List<String> _sentences = const [];
+  List<int> _sentenceOffsets = const [];
+  bool _isCancelled = false;
 
   // Inversion matrix to convert white PDF pages to dark surfaces
   static const ColorFilter _nightInvertFilter = ColorFilter.matrix([
@@ -90,6 +97,8 @@ class _ReaderScreenState extends State<ReaderScreen>
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
 
     _initPdfController();
+    // Warm up TTS in background so first spoken sentence starts instantly
+    _getKittenTts().then((_) {}, onError: (_) {});
   }
 
   @override
@@ -130,6 +139,7 @@ class _ReaderScreenState extends State<ReaderScreen>
     // Persist current page immediately on exit
     widget.bookRepository.updateProgress(widget.book.id, _currentPage - 1);
     _stopNarration();
+    _readAlongScrollController.dispose();
     _kittenTts?.dispose();
     _kittenPlayer.dispose();
     if (!_isLoading) _pdfController.dispose();
@@ -220,30 +230,141 @@ class _ReaderScreenState extends State<ReaderScreen>
     return text;
   }
 
+  List<String> _extractSentences(String text) {
+    // Split on periods, exclamation marks, question marks, or double newlines while keeping abbreviations reasonable
+    final matches = RegExp(r'[^.!?\n]+[.!?\n]*').allMatches(text);
+    final list = <String>[];
+    for (final m in matches) {
+      final s = m.group(0)?.trim() ?? '';
+      if (s.isNotEmpty) list.add(s);
+    }
+    return list.isEmpty ? [text.trim()] : list;
+  }
+
   Future<void> _speakCurrentPage() async {
     if (_spokenText.trim().isEmpty) return;
     await _stopNarration();
     if (!mounted) return;
-    setState(() => _isPreparingVoice = true);
+
+    _isCancelled = false;
+    _currentSentenceIndex = 0;
+    _sentences = _extractSentences(_spokenText);
+
+    // Compute cumulative word offsets for each sentence based on whole-page tokenization
+    final pageWords = RegExp(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*")
+        .allMatches(_spokenText)
+        .toList();
+    final offsets = <int>[];
+    var searchIdx = 0;
+    for (final sentence in _sentences) {
+      final sentMatches = RegExp(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*")
+          .allMatches(sentence)
+          .length;
+      offsets.add(searchIdx);
+      searchIdx += sentMatches;
+    }
+    _sentenceOffsets = offsets;
+
+    setState(() {
+      _isPreparingVoice = true;
+      _activeWordIndex = 0;
+    });
+
     try {
       final tts = await _getKittenTts();
-      final result = await tts.generate(
-        _spokenText,
-        voice: 'luna',
-        speed: 0.94,
-      );
-      if (!mounted) return;
-      setState(() {
-        _wordTimings = result.wordTimings;
-        _isPreparingVoice = false;
-      });
-      await tts.play(
-        result,
-        AudioPlayOptions(onPlaybackStart: _startHighlighting),
-      );
-      _resetNarrationState();
+      if (_isCancelled || !mounted) return;
+
+      // Pipeline cache: pre-generate next sentence in background while current plays
+      Future<KittenTTSResult>? nextGenFuture;
+
+      for (var i = 0; i < _sentences.length; i++) {
+        if (_isCancelled || !mounted) break;
+        _currentSentenceIndex = i;
+        final sentence = _sentences[i];
+        final wordOffset = i < _sentenceOffsets.length ? _sentenceOffsets[i] : 0;
+
+        // Fetch current sentence result (either awaited from background prefetch or generated now)
+        final KittenTTSResult result;
+        if (nextGenFuture != null) {
+          result = await nextGenFuture;
+        } else {
+          result = await tts.generate(
+            sentence,
+            voice: _selectedVoice,
+            speed: _playbackSpeed,
+          );
+        }
+
+        if (_isCancelled || !mounted) break;
+
+        // Immediately trigger generation of next sentence in parallel
+        if (i + 1 < _sentences.length) {
+          final nextSentence = _sentences[i + 1];
+          nextGenFuture = tts.generate(
+            nextSentence,
+            voice: _selectedVoice,
+            speed: _playbackSpeed,
+          );
+        } else {
+          nextGenFuture = null;
+        }
+
+        setState(() {
+          _wordTimings = result.wordTimings;
+          _isPreparingVoice = false;
+        });
+
+        await tts.play(
+          result,
+          AudioPlayOptions(
+            onPlaybackStart: () {
+              _playbackClock
+                ..reset()
+                ..start();
+              _highlightTimer?.cancel();
+              _highlightTimer = Timer.periodic(const Duration(milliseconds: 35), (_) {
+                if (!mounted || _isCancelled) return;
+                final elapsed = _playbackClock.elapsedMilliseconds / 1000;
+                final active = _wordTimings.where(
+                  (timing) => elapsed >= timing.startTime && elapsed < timing.endTime,
+                );
+                final sentenceWordIndex = active.isEmpty ? null : active.first.wordIndex;
+                final newActiveIndex = sentenceWordIndex != null ? wordOffset + sentenceWordIndex : null;
+                if (newActiveIndex != _activeWordIndex) {
+                  setState(() {
+                    _activeWordIndex = newActiveIndex;
+                  });
+                  // Auto-scroll follow the active word
+                  if (newActiveIndex != null && _readAlongScrollController.hasClients && pageWords.isNotEmpty) {
+                    final progress = (newActiveIndex / pageWords.length).clamp(0.0, 1.0);
+                    final maxScroll = _readAlongScrollController.position.maxScrollExtent;
+                    final targetOffset = maxScroll * progress;
+                    if ((targetOffset - _readAlongScrollController.offset).abs() > 40) {
+                      _readAlongScrollController.animateTo(
+                        targetOffset,
+                        duration: const Duration(milliseconds: 200),
+                        curve: Curves.easeOut,
+                      );
+                    }
+                  }
+                }
+              });
+              if (mounted) {
+                setState(() {
+                  _isSpeaking = true;
+                  _isPaused = false;
+                });
+              }
+            },
+          ),
+        );
+      }
+
+      if (!_isCancelled) {
+        _resetNarrationState();
+      }
     } catch (_) {
-      if (mounted) {
+      if (mounted && !_isCancelled) {
         setState(() {
           _isPreparingVoice = false;
           _readAlongError = 'Could not prepare the offline narrator.';
@@ -347,20 +468,6 @@ class _ReaderScreenState extends State<ReaderScreen>
     return tts;
   }
 
-  void _startHighlighting() {
-    _playbackClock
-      ..reset()
-      ..start();
-    _startHighlightTimer();
-    if (mounted) {
-      setState(() {
-        _isPreparingVoice = false;
-        _isSpeaking = true;
-        _isPaused = false;
-      });
-    }
-  }
-
   void _startHighlightTimer() {
     _highlightTimer?.cancel();
     _highlightTimer = Timer.periodic(const Duration(milliseconds: 45), (_) {
@@ -376,11 +483,13 @@ class _ReaderScreenState extends State<ReaderScreen>
   }
 
   Future<void> _stopNarration() async {
+    _isCancelled = true;
     _highlightTimer?.cancel();
     _highlightTimer = null;
     _playbackClock
       ..stop()
       ..reset();
+    await _kittenPlayer.stop();
     await _kittenTts?.stop();
     _resetNarrationState();
   }
@@ -598,10 +707,9 @@ class _ReaderScreenState extends State<ReaderScreen>
           AnimatedPositioned(
             duration: const Duration(milliseconds: 200),
             curve: Curves.easeOut,
-            bottom: _showHud
-                ? MediaQuery.of(context).padding.bottom +
-                      (_isReadAlongVisible ? 278 : 16)
-                : -110,
+            bottom: (_showHud && !_isReadAlongVisible)
+                ? MediaQuery.of(context).padding.bottom + 16
+                : -130,
             left: 16,
             right: 16,
             child: Container(
@@ -675,8 +783,10 @@ class _ReaderScreenState extends State<ReaderScreen>
   }
 
   Widget _buildReadAlongSheet() {
+    final screenHeight = MediaQuery.of(context).size.height;
+    final maxSheetHeight = (screenHeight * 0.35).clamp(200.0, 300.0);
     return Container(
-      constraints: const BoxConstraints(maxHeight: 245),
+      constraints: BoxConstraints(maxHeight: maxSheetHeight),
       padding: const EdgeInsets.fromLTRB(16, 12, 12, 14),
       decoration: BoxDecoration(
         color: const Color(0xF50D0F12),
@@ -702,14 +812,76 @@ class _ReaderScreenState extends State<ReaderScreen>
                 color: AppTheme.amberGold,
               ),
               const SizedBox(width: 8),
-              const Expanded(
-                child: Text(
-                  'READ ALONG',
-                  style: TextStyle(
-                    color: AppTheme.textPrimary,
-                    fontSize: 12,
-                    letterSpacing: 0.8,
-                    fontWeight: FontWeight.bold,
+              const Text(
+                'READ ALONG',
+                style: TextStyle(
+                  color: AppTheme.textPrimary,
+                  fontSize: 12,
+                  letterSpacing: 0.8,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const Spacer(),
+              // Voice selector dropdown
+              Container(
+                height: 28,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                decoration: BoxDecoration(
+                  color: AppTheme.slateCardLight,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: AppTheme.borderSubtle, width: 0.8),
+                ),
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<String>(
+                    value: _selectedVoice,
+                    dropdownColor: AppTheme.slateCard,
+                    icon: const Icon(Icons.arrow_drop_down, color: AppTheme.amberGold, size: 18),
+                    style: const TextStyle(fontSize: 11, color: AppTheme.textPrimary, fontWeight: FontWeight.w600),
+                    items: const [
+                      DropdownMenuItem(value: 'luna', child: Text('Luna (Soft)')),
+                      DropdownMenuItem(value: 'bella', child: Text('Bella (Warm)')),
+                      DropdownMenuItem(value: 'jasper', child: Text('Jasper (Narrator)')),
+                      DropdownMenuItem(value: 'bruno', child: Text('Bruno (Deep)')),
+                      DropdownMenuItem(value: 'rosie', child: Text('Rosie (Bright)')),
+                      DropdownMenuItem(value: 'hugo', child: Text('Hugo (Calm)')),
+                    ],
+                    onChanged: (newVoice) {
+                      if (newVoice != null && newVoice != _selectedVoice) {
+                        setState(() => _selectedVoice = newVoice);
+                        if (_isSpeaking) _speakCurrentPage();
+                      }
+                    },
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              // Speed toggle button
+              InkWell(
+                onTap: () {
+                  final nextSpeed = _playbackSpeed == 0.9
+                      ? 1.0
+                      : (_playbackSpeed == 1.0 ? 1.15 : 0.9);
+                  setState(() => _playbackSpeed = nextSpeed);
+                  if (_isSpeaking) _speakCurrentPage();
+                },
+                borderRadius: BorderRadius.circular(8),
+                child: Container(
+                  height: 28,
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: AppTheme.slateCardLight,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: AppTheme.borderSubtle, width: 0.8),
+                  ),
+                  child: Center(
+                    child: Text(
+                      '${_playbackSpeed}x',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: AppTheme.amberGold,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -724,23 +896,24 @@ class _ReaderScreenState extends State<ReaderScreen>
               ),
             ],
           ),
-          if (_isLoadingReadAlong || _isPreparingVoice)
+          const SizedBox(height: 6),
+          if (_isLoadingReadAlong)
             const Padding(
-              padding: EdgeInsets.symmetric(vertical: 38),
-              child: Column(
-                children: [
-                  CircularProgressIndicator(color: AppTheme.amberGold),
-                  SizedBox(height: 12),
-                  Text(
-                    'Preparing Luna, your offline narrator…',
-                    style: TextStyle(color: AppTheme.textSecondary),
-                  ),
-                ],
+              padding: EdgeInsets.symmetric(vertical: 36),
+              child: Center(
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: AppTheme.amberGold)),
+                    SizedBox(width: 10),
+                    Text('Reading page text…', style: TextStyle(color: AppTheme.textSecondary, fontSize: 13)),
+                  ],
+                ),
               ),
             )
           else if (_readAlongError != null)
             Padding(
-              padding: const EdgeInsets.symmetric(vertical: 28),
+              padding: const EdgeInsets.symmetric(vertical: 24),
               child: Text(
                 _readAlongError!,
                 style: const TextStyle(
@@ -752,19 +925,21 @@ class _ReaderScreenState extends State<ReaderScreen>
           else ...[
             Expanded(
               child: SingleChildScrollView(
+                controller: _readAlongScrollController,
+                physics: const BouncingScrollPhysics(),
                 child: Text.rich(
                   TextSpan(
                     style: const TextStyle(
                       color: AppTheme.textPrimary,
                       height: 1.55,
-                      fontSize: 15,
+                      fontSize: 14.5,
                     ),
                     children: _highlightedText(),
                   ),
                 ),
               ),
             ),
-            const SizedBox(height: 10),
+            const SizedBox(height: 8),
             Row(
               children: [
                 IconButton(
@@ -783,7 +958,7 @@ class _ReaderScreenState extends State<ReaderScreen>
                 const SizedBox(width: 6),
                 Text(
                   _isSpeaking
-                      ? 'READING PAGE $_currentPage'
+                      ? (_isPreparingVoice ? 'PREPARING SPEECH…' : 'READING SENTENCE ${_currentSentenceIndex + 1}/${_sentences.length}')
                       : 'PAGE $_currentPage',
                   style: const TextStyle(
                     color: AppTheme.textSecondary,
@@ -844,6 +1019,8 @@ class _ReaderScreenState extends State<ReaderScreen>
 
 class _KittenAudioPlayer implements AudioPlayer {
   final audio.AudioPlayer _player = audio.AudioPlayer();
+  Completer<void>? _activePlaybackCompleter;
+  StreamSubscription<void>? _completeSubscription;
 
   @override
   Future<void> play(
@@ -851,27 +1028,54 @@ class _KittenAudioPlayer implements AudioPlayer {
     int sampleRate, {
     AudioPlayOptions options = const AudioPlayOptions(),
   }) async {
-    final completed = _player.onPlayerComplete.first;
-    await _player.stop();
-    await _player.play(
-      audio.BytesSource(
-        WAVEncoder.encode(samples, sampleRate),
-        mimeType: 'audio/wav',
-      ),
-    );
-    options.onPlaybackStart?.call();
-    await Future.any([
-      completed,
-      Future<void>.delayed(
-        Duration(
-          milliseconds: (samples.length / sampleRate * 1000).ceil() + 750,
+    await stop();
+
+    final completer = Completer<void>();
+    _activePlaybackCompleter = completer;
+
+    _completeSubscription = _player.onPlayerComplete.listen((_) {
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    });
+
+    final durationMs = (samples.length / sampleRate * 1000).ceil();
+    final safetyTimer = Timer(Duration(milliseconds: durationMs + 800), () {
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    });
+
+    try {
+      await _player.play(
+        audio.BytesSource(
+          WAVEncoder.encode(samples, sampleRate),
+          mimeType: 'audio/wav',
         ),
-      ),
-    ]);
+      );
+      options.onPlaybackStart?.call();
+      await completer.future;
+    } finally {
+      safetyTimer.cancel();
+      await _completeSubscription?.cancel();
+      _completeSubscription = null;
+      if (identical(_activePlaybackCompleter, completer)) {
+        _activePlaybackCompleter = null;
+      }
+    }
   }
 
   @override
-  Future<void> stop() => _player.stop();
+  Future<void> stop() async {
+    final comp = _activePlaybackCompleter;
+    if (comp != null && !comp.isCompleted) {
+      comp.complete();
+    }
+    _activePlaybackCompleter = null;
+    await _completeSubscription?.cancel();
+    _completeSubscription = null;
+    await _player.stop();
+  }
 
   @override
   Future<void> pause() => _player.pause();
@@ -882,5 +1086,8 @@ class _KittenAudioPlayer implements AudioPlayer {
   @override
   bool get isPlaying => _player.state == audio.PlayerState.playing;
 
-  Future<void> dispose() => _player.dispose();
+  Future<void> dispose() async {
+    await stop();
+    await _player.dispose();
+  }
 }
