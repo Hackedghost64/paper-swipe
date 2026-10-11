@@ -57,6 +57,7 @@ class _ReaderScreenState extends State<ReaderScreen>
   List<String> _sentences = const [];
   List<int> _sentenceOffsets = const [];
   bool _isCancelled = false;
+  int _speechSessionId = 0;
 
   // Inversion matrix to convert white PDF pages to dark surfaces
   static const ColorFilter _nightInvertFilter = ColorFilter.matrix([
@@ -246,6 +247,7 @@ class _ReaderScreenState extends State<ReaderScreen>
     await _stopNarration();
     if (!mounted) return;
 
+    final sessionId = ++_speechSessionId;
     _isCancelled = false;
     _currentSentenceIndex = 0;
     _sentences = _extractSentences(_spokenText);
@@ -272,13 +274,13 @@ class _ReaderScreenState extends State<ReaderScreen>
 
     try {
       final tts = await _getKittenTts();
-      if (_isCancelled || !mounted) return;
+      if (_isCancelled || sessionId != _speechSessionId || !mounted) return;
 
       // Pipeline cache: pre-generate next sentence in background while current plays
       Future<KittenTTSResult>? nextGenFuture;
 
       for (var i = 0; i < _sentences.length; i++) {
-        if (_isCancelled || !mounted) break;
+        if (_isCancelled || sessionId != _speechSessionId || !mounted) break;
         _currentSentenceIndex = i;
         final sentence = _sentences[i];
         final wordOffset = i < _sentenceOffsets.length ? _sentenceOffsets[i] : 0;
@@ -295,7 +297,7 @@ class _ReaderScreenState extends State<ReaderScreen>
           );
         }
 
-        if (_isCancelled || !mounted) break;
+        if (_isCancelled || sessionId != _speechSessionId || !mounted) break;
 
         // Immediately trigger generation of next sentence in parallel
         if (i + 1 < _sentences.length) {
@@ -318,12 +320,13 @@ class _ReaderScreenState extends State<ReaderScreen>
           result,
           AudioPlayOptions(
             onPlaybackStart: () {
+              if (sessionId != _speechSessionId || !mounted) return;
               _playbackClock
                 ..reset()
                 ..start();
               _highlightTimer?.cancel();
               _highlightTimer = Timer.periodic(const Duration(milliseconds: 35), (_) {
-                if (!mounted || _isCancelled) return;
+                if (!mounted || _isCancelled || sessionId != _speechSessionId) return;
                 final elapsed = _playbackClock.elapsedMilliseconds / 1000;
                 final active = _wordTimings.where(
                   (timing) => elapsed >= timing.startTime && elapsed < timing.endTime,
@@ -349,7 +352,7 @@ class _ReaderScreenState extends State<ReaderScreen>
                   }
                 }
               });
-              if (mounted) {
+              if (mounted && sessionId == _speechSessionId) {
                 setState(() {
                   _isSpeaking = true;
                   _isPaused = false;
@@ -360,11 +363,11 @@ class _ReaderScreenState extends State<ReaderScreen>
         );
       }
 
-      if (!_isCancelled) {
+      if (!_isCancelled && sessionId == _speechSessionId) {
         _resetNarrationState();
       }
     } catch (_) {
-      if (mounted && !_isCancelled) {
+      if (mounted && !_isCancelled && sessionId == _speechSessionId) {
         setState(() {
           _isPreparingVoice = false;
           _readAlongError = 'Could not prepare the offline narrator.';
@@ -483,6 +486,7 @@ class _ReaderScreenState extends State<ReaderScreen>
   }
 
   Future<void> _stopNarration() async {
+    _speechSessionId++;
     _isCancelled = true;
     _highlightTimer?.cancel();
     _highlightTimer = null;
@@ -808,24 +812,27 @@ class _ReaderScreenState extends State<ReaderScreen>
             children: [
               const Icon(
                 Icons.record_voice_over,
-                size: 18,
+                size: 16,
                 color: AppTheme.amberGold,
               ),
-              const SizedBox(width: 8),
-              const Text(
-                'READ ALONG',
-                style: TextStyle(
-                  color: AppTheme.textPrimary,
-                  fontSize: 12,
-                  letterSpacing: 0.8,
-                  fontWeight: FontWeight.bold,
+              const SizedBox(width: 6),
+              const Flexible(
+                child: Text(
+                  'READ ALONG',
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: AppTheme.textPrimary,
+                    fontSize: 11,
+                    letterSpacing: 0.8,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
-              const Spacer(),
+              const SizedBox(width: 6),
               // Voice selector dropdown
               Container(
                 height: 28,
-                padding: const EdgeInsets.symmetric(horizontal: 8),
+                padding: const EdgeInsets.symmetric(horizontal: 6),
                 decoration: BoxDecoration(
                   color: AppTheme.slateCardLight,
                   borderRadius: BorderRadius.circular(8),
@@ -835,15 +842,16 @@ class _ReaderScreenState extends State<ReaderScreen>
                   child: DropdownButton<String>(
                     value: _selectedVoice,
                     dropdownColor: AppTheme.slateCard,
-                    icon: const Icon(Icons.arrow_drop_down, color: AppTheme.amberGold, size: 18),
+                    isDense: true,
+                    icon: const Icon(Icons.arrow_drop_down, color: AppTheme.amberGold, size: 16),
                     style: const TextStyle(fontSize: 11, color: AppTheme.textPrimary, fontWeight: FontWeight.w600),
                     items: const [
-                      DropdownMenuItem(value: 'luna', child: Text('Luna (Soft)')),
-                      DropdownMenuItem(value: 'bella', child: Text('Bella (Warm)')),
-                      DropdownMenuItem(value: 'jasper', child: Text('Jasper (Narrator)')),
-                      DropdownMenuItem(value: 'bruno', child: Text('Bruno (Deep)')),
-                      DropdownMenuItem(value: 'rosie', child: Text('Rosie (Bright)')),
-                      DropdownMenuItem(value: 'hugo', child: Text('Hugo (Calm)')),
+                      DropdownMenuItem(value: 'luna', child: Text('Luna')),
+                      DropdownMenuItem(value: 'bella', child: Text('Bella')),
+                      DropdownMenuItem(value: 'jasper', child: Text('Jasper')),
+                      DropdownMenuItem(value: 'bruno', child: Text('Bruno')),
+                      DropdownMenuItem(value: 'rosie', child: Text('Rosie')),
+                      DropdownMenuItem(value: 'hugo', child: Text('Hugo')),
                     ],
                     onChanged: (newVoice) {
                       if (newVoice != null && newVoice != _selectedVoice) {
@@ -854,7 +862,7 @@ class _ReaderScreenState extends State<ReaderScreen>
                   ),
                 ),
               ),
-              const SizedBox(width: 6),
+              const SizedBox(width: 4),
               // Speed toggle button
               InkWell(
                 onTap: () {
@@ -867,7 +875,7 @@ class _ReaderScreenState extends State<ReaderScreen>
                 borderRadius: BorderRadius.circular(8),
                 child: Container(
                   height: 28,
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                   decoration: BoxDecoration(
                     color: AppTheme.slateCardLight,
                     borderRadius: BorderRadius.circular(8),
@@ -885,14 +893,22 @@ class _ReaderScreenState extends State<ReaderScreen>
                   ),
                 ),
               ),
-              IconButton(
-                icon: const Icon(
-                  Icons.close,
-                  color: AppTheme.textSecondary,
-                  size: 20,
+              const SizedBox(width: 2),
+              // Compact close button that never overflows
+              SizedBox(
+                width: 28,
+                height: 28,
+                child: IconButton(
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(),
+                  icon: const Icon(
+                    Icons.close,
+                    color: AppTheme.textSecondary,
+                    size: 18,
+                  ),
+                  onPressed: _closeReadAlong,
+                  tooltip: 'Close read along',
                 ),
-                onPressed: _closeReadAlong,
-                tooltip: 'Close read along',
               ),
             ],
           ),
