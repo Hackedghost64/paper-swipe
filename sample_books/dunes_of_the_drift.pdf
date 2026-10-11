@@ -1,0 +1,32 @@
+%PDF-1.4
+1 0 obj <</Type /Catalog /Pages 2 0 R>> endobj
+2 0 obj <</Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3>> endobj
+3 0 obj <</Type /Page /Parent 2 0 R /MediaBox [0 0 400 600] /Contents 6 0 R /Resources <</Font <</F1 9 0 R>>>>>> endobj
+4 0 obj <</Type /Page /Parent 2 0 R /MediaBox [0 0 400 600] /Contents 7 0 R /Resources <</Font <</F1 9 0 R>>>>>> endobj
+5 0 obj <</Type /Page /Parent 2 0 R /MediaBox [0 0 400 600] /Contents 8 0 R /Resources <</Font <</F1 9 0 R>>>>>> endobj
+6 0 obj <</Length 92>> stream
+BT /F1 20 Tf 50 500 Td (PaperSwipe Sample Novel) Tj /F1 12 Tf 50 450 Td (Chapter 1: The Whispering Sands) Tj ET
+endstream endobj
+7 0 obj <</Length 96>> stream
+BT /F1 16 Tf 50 520 Td (Chapter 2: The Silent Citadel) Tj /F1 11 Tf 50 470 Td (Swipe left to proceed to chapter 3.) Tj ET
+endstream endobj
+8 0 obj <</Length 88>> stream
+BT /F1 16 Tf 50 520 Td (Chapter 3: The Golden Dawn) Tj /F1 11 Tf 50 470 Td (You reached the end of the sample!) Tj ET
+endstream endobj
+9 0 obj <</Type /Font /Subtype /Type1 /BaseFont /Helvetica>> endobj
+xref
+0 10
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000133 00000 n 
+0000000257 00000 n 
+0000000381 00000 n 
+0000000505 00000 n 
+0000000649 00000 n 
+0000000797 00000 n 
+0000000937 00000 n 
+trailer <</Size 10 /Root 1 0 R>>
+startxref
+1008
+%%EOF
