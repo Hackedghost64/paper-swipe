@@ -231,15 +231,175 @@ class _ReaderScreenState extends State<ReaderScreen>
     return text;
   }
 
+  static const Map<String, String> _contractionsMap = {
+    "you've": "you have",
+    "you're": "you are",
+    "you'll": "you will",
+    "you'd": "you would",
+    "i'm": "i am",
+    "i've": "i have",
+    "i'll": "i will",
+    "i'd": "i would",
+    "we've": "we have",
+    "we're": "we are",
+    "we'll": "we will",
+    "we'd": "we would",
+    "they've": "they have",
+    "they're": "they are",
+    "they'll": "they will",
+    "they'd": "they would",
+    "it's": "it is",
+    "it'll": "it will",
+    "that's": "that is",
+    "there's": "there is",
+    "what's": "what is",
+    "who's": "who is",
+    "don't": "do not",
+    "doesn't": "does not",
+    "didn't": "did not",
+    "can't": "cannot",
+    "won't": "will not",
+    "wouldn't": "would not",
+    "couldn't": "could not",
+    "shouldn't": "should not",
+    "isn't": "is not",
+    "aren't": "are not",
+    "wasn't": "was not",
+    "weren't": "were not",
+    "haven't": "have not",
+    "hasn't": "has not",
+    "hadn't": "had not",
+  };
+
+  String _cleanSpokenText(String rawText) {
+    var text = rawText
+        // Replace smart apostrophes / single quotes with standard ASCII apostrophe
+        .replaceAll(RegExp(r'[\u2018\u2019\u201B\u2032`´]'), "'")
+        // Replace smart double quotes with standard double quote
+        .replaceAll(RegExp(r'[\u201C\u201D\u201E\u201F\u2033]'), '"')
+        // Replace unicode dashes / hyphens with standard hyphen or space
+        .replaceAll(RegExp(r'[\u2013\u2014]'), ' - ')
+        // Remove soft hyphens and zero-width spaces
+        .replaceAll(RegExp(r'[\u00AD\u200B\u200C\u200D\uFEFF]'), '')
+        // Clean multiple whitespace / newlines
+        .replaceAll(RegExp(r'[ \t]+'), ' ');
+
+    return text.trim();
+  }
+
+  String _normalizeForPhonemizer(String sentence) {
+    var s = sentence
+        .replaceAll(RegExp(r'[\u2018\u2019\u201B\u2032`´]'), "'")
+        .replaceAll(RegExp(r'[\u201C\u201D\u201E\u201F\u2033]'), '"');
+
+    // Expand known contractions if any could cause phonemizer truncation or stutter
+    _contractionsMap.forEach((contraction, expansion) {
+      s = s.replaceAllMapped(
+        RegExp('\\b$contraction\\b', caseSensitive: false),
+        (match) {
+          final matchedText = match.group(0)!;
+          if (matchedText.isEmpty) return expansion;
+          // Preserve first character casing
+          final isCapitalized = matchedText[0] == matchedText[0].toUpperCase() &&
+              matchedText[0] != matchedText[0].toLowerCase();
+          if (isCapitalized && expansion.isNotEmpty) {
+            return expansion[0].toUpperCase() + expansion.substring(1);
+          }
+          return expansion;
+        },
+      );
+    });
+
+    // Ensure spaces after commas and semicolons so clauses don't clump
+    s = s.replaceAllMapped(RegExp(r'([,;:])([^\s])'), (m) => '${m[1]} ${m[2]}');
+    return s.trim();
+  }
+
   List<String> _extractSentences(String text) {
-    // Split on periods, exclamation marks, question marks, or double newlines while keeping abbreviations reasonable
-    final matches = RegExp(r'[^.!?\n]+[.!?\n]*').allMatches(text);
-    final list = <String>[];
-    for (final m in matches) {
-      final s = m.group(0)?.trim() ?? '';
-      if (s.isNotEmpty) list.add(s);
+    if (text.trim().isEmpty) return const [];
+
+    // First replace single newlines that are just line-wraps inside a paragraph with spaces
+    final unwrap = text
+        .replaceAll(RegExp(r'(?<!\n)\n(?!\n)'), ' ')
+        .replaceAll(RegExp(r'\n{2,}'), '\n\n');
+
+    // Abbreviations that should never cause sentence breaks
+    const abbrevs = [
+      'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'vs', 'etc', 'i.e', 'e.g',
+      'u.s', 'u.k', 'fig', 'al', 'no', 'vol', 'dept', 'est', 'approx'
+    ];
+
+    final sentences = <String>[];
+    final buffer = StringBuffer();
+    final chars = unwrap.runes.map((r) => String.fromCharCode(r)).toList();
+
+    for (var i = 0; i < chars.length; i++) {
+      final ch = chars[i];
+      buffer.write(ch);
+
+      // Check for paragraph break
+      if (ch == '\n' && i + 1 < chars.length && chars[i + 1] == '\n') {
+        final candidate = buffer.toString().trim();
+        if (candidate.isNotEmpty) {
+          sentences.add(candidate);
+        }
+        buffer.clear();
+        i++; // skip next newline
+        continue;
+      }
+
+      // Check for sentence terminator
+      if (ch == '.' || ch == '!' || ch == '?') {
+        // Lookahead: is this a decimal number? e.g. 3.14
+        final isDigitBefore = i > 0 && RegExp(r'[0-9]').hasMatch(chars[i - 1]);
+        final isDigitAfter = i + 1 < chars.length && RegExp(r'[0-9]').hasMatch(chars[i + 1]);
+        if (isDigitBefore && isDigitAfter) {
+          continue; // Part of a number
+        }
+
+        // Lookahead: is this an abbreviation?
+        final currentBuf = buffer.toString();
+        final words = currentBuf.split(RegExp(r'\s+'));
+        final lastWord = words.isNotEmpty ? words.last.toLowerCase().replaceAll(RegExp(r'[^a-z.]'), '') : '';
+        final withoutDot = lastWord.replaceAll('.', '');
+        if (abbrevs.contains(withoutDot) || (lastWord.length <= 2 && RegExp(r'^[a-z]\.$').hasMatch(lastWord))) {
+          // Likely an abbreviation or initial (e.g. J. K. Rowling)
+          continue;
+        }
+
+        // Lookahead: next character must be whitespace, quote, bracket, or end of string
+        var isRealEnd = false;
+        if (i + 1 >= chars.length) {
+          isRealEnd = true;
+        } else {
+          var j = i + 1;
+          // Consume closing quotes or brackets
+          while (j < chars.length && (chars[j] == '"' || chars[j] == "'" || chars[j] == '”' || chars[j] == '’' || chars[j] == ')' || chars[j] == ']')) {
+            buffer.write(chars[j]);
+            j++;
+            i = j - 1;
+          }
+          if (j >= chars.length || RegExp(r'\s').hasMatch(chars[j])) {
+            isRealEnd = true;
+          }
+        }
+
+        if (isRealEnd) {
+          final candidate = buffer.toString().trim();
+          if (candidate.isNotEmpty) {
+            sentences.add(candidate);
+          }
+          buffer.clear();
+        }
+      }
     }
-    return list.isEmpty ? [text.trim()] : list;
+
+    final leftover = buffer.toString().trim();
+    if (leftover.isNotEmpty) {
+      sentences.add(leftover);
+    }
+
+    return sentences.isEmpty ? [text.trim()] : sentences;
   }
 
   Future<void> _speakCurrentPage() async {
@@ -250,7 +410,10 @@ class _ReaderScreenState extends State<ReaderScreen>
     final sessionId = ++_speechSessionId;
     _isCancelled = false;
     _currentSentenceIndex = 0;
-    _sentences = _extractSentences(_spokenText);
+
+    // Clean text representations
+    final normalizedPage = _cleanSpokenText(_spokenText);
+    _sentences = _extractSentences(normalizedPage);
 
     // Compute cumulative word offsets for each sentence based on whole-page tokenization
     final pageWords = RegExp(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*")
@@ -276,40 +439,55 @@ class _ReaderScreenState extends State<ReaderScreen>
       final tts = await _getKittenTts();
       if (_isCancelled || sessionId != _speechSessionId || !mounted) return;
 
-      // Pipeline cache: pre-generate next sentence in background while current plays
-      Future<KittenTTSResult>? nextGenFuture;
+      // Pipeline sliding-window pre-generation buffer (buffers up to 3 sentences ahead)
+      // This compensates for 1.15x and faster speeds so audio never stutters or starves.
+      const bufferAheadCount = 3;
+      final prefetchMap = <int, Future<KittenTTSResult>>{};
+
+      void primePrefetch(int startIndex) {
+        for (var offset = 0; offset <= bufferAheadCount; offset++) {
+          final targetIdx = startIndex + offset;
+          if (targetIdx < _sentences.length && !prefetchMap.containsKey(targetIdx)) {
+            final toSpeak = _normalizeForPhonemizer(_sentences[targetIdx]);
+            prefetchMap[targetIdx] = tts.generate(
+              toSpeak,
+              voice: _selectedVoice,
+              speed: _playbackSpeed,
+            );
+          }
+        }
+      }
+
+      // Pre-warm the initial window of sentences
+      primePrefetch(0);
 
       for (var i = 0; i < _sentences.length; i++) {
         if (_isCancelled || sessionId != _speechSessionId || !mounted) break;
         _currentSentenceIndex = i;
-        final sentence = _sentences[i];
         final wordOffset = i < _sentenceOffsets.length ? _sentenceOffsets[i] : 0;
 
-        // Fetch current sentence result (either awaited from background prefetch or generated now)
+        // Ensure lookahead buffer is filled
+        primePrefetch(i);
+
         final KittenTTSResult result;
-        if (nextGenFuture != null) {
-          result = await nextGenFuture;
+        final pending = prefetchMap[i];
+        if (pending != null) {
+          result = await pending;
         } else {
+          final toSpeak = _normalizeForPhonemizer(_sentences[i]);
           result = await tts.generate(
-            sentence,
+            toSpeak,
             voice: _selectedVoice,
             speed: _playbackSpeed,
           );
         }
+        // Clean up completed future to free memory
+        prefetchMap.remove(i);
 
         if (_isCancelled || sessionId != _speechSessionId || !mounted) break;
 
-        // Immediately trigger generation of next sentence in parallel
-        if (i + 1 < _sentences.length) {
-          final nextSentence = _sentences[i + 1];
-          nextGenFuture = tts.generate(
-            nextSentence,
-            voice: _selectedVoice,
-            speed: _playbackSpeed,
-          );
-        } else {
-          nextGenFuture = null;
-        }
+        // Keep filling buffer for upcoming sentences while this one plays
+        primePrefetch(i + 1);
 
         setState(() {
           _wordTimings = result.wordTimings;
@@ -325,7 +503,7 @@ class _ReaderScreenState extends State<ReaderScreen>
                 ..reset()
                 ..start();
               _highlightTimer?.cancel();
-              _highlightTimer = Timer.periodic(const Duration(milliseconds: 35), (_) {
+              _highlightTimer = Timer.periodic(const Duration(milliseconds: 30), (_) {
                 if (!mounted || _isCancelled || sessionId != _speechSessionId) return;
                 final elapsed = _playbackClock.elapsedMilliseconds / 1000;
                 final active = _wordTimings.where(
